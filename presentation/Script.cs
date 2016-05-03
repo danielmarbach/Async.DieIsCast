@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -145,5 +146,132 @@ private static Task DoesShortcut()
 
 */
 
+        [Test]
+        public async Task TheCompletePumpWithBlockingHandleMessage()
+        {
+            #region Concurrency Limit and Task Tracking
+
+            var runningTasks = new ConcurrentDictionary<Task, Task>();
+            var semaphore = new SemaphoreSlim(100);
+            var tokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var token = tokenSource.Token;
+            int numberOfTasks = 0;
+
+            #endregion
+
+            var pumpTask = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    #region Concurrency Limit
+
+                    await semaphore.WaitAsync(token).ConfigureAwait(false);
+
+                    #endregion
+
+                    var runningTask = Task.Run(() =>
+                    {
+                        Interlocked.Increment(ref numberOfTasks);
+
+                        return BlockingHandleMessage(token);
+                    }, CancellationToken.None);
+
+                    #region Task Tracking
+
+                    runningTasks.TryAdd(runningTask, runningTask);
+
+                    runningTask.ContinueWith(t =>
+                    {
+                        semaphore.Release();
+
+                        Task taskToBeRemoved;
+                        runningTasks.TryRemove(t, out taskToBeRemoved);
+                    }, TaskContinuationOptions.ExecuteSynchronously)
+                        .Ignore();
+
+                    #endregion
+                }
+            });
+
+            #region Await Completion
+
+            await pumpTask.IgnoreCancellation().ConfigureAwait(false);
+            await Task.WhenAll(runningTasks.Values).IgnoreCancellation().ConfigureAwait(false);
+            tokenSource.Dispose();
+
+            $"Consumed {numberOfTasks} messages with concurrency {semaphore.CurrentCount} in 5 seconds. Throughput {numberOfTasks/5} msgs/s"
+                .Output();
+
+            #endregion
+        }
+
+        private static Task BlockingHandleMessage(CancellationToken cancellationToken = default(CancellationToken))
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return Task.FromCanceled(cancellationToken);
+            }
+
+            Thread.Sleep(1000);
+            return Task.CompletedTask;
+        }
+
+        [Test]
+        public async Task TheCompletePumpWithAsyncHandleMessage()
+        {
+            #region Concurrency Limit and Task Tracking
+            var runningTasks = new ConcurrentDictionary<Task, Task>();
+            var semaphore = new SemaphoreSlim(100);
+            var tokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var token = tokenSource.Token;
+            int numberOfTasks = 0;
+            #endregion
+
+            var pumpTask = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    #region Concurrency Limit
+
+                    await semaphore.WaitAsync(token).ConfigureAwait(false);
+
+                    #endregion
+
+                    var task = HandleMessageWithCancellation(token);
+
+                    #region Task Tracking
+                    Interlocked.Increment(ref numberOfTasks);
+
+                    runningTasks.TryAdd(task, task);
+
+                    task.ContinueWith(t =>
+                    {
+                        semaphore.Release();
+                        Task taskToBeRemoved;
+                        runningTasks.TryRemove(t, out taskToBeRemoved);
+                    }, TaskContinuationOptions.ExecuteSynchronously)
+                        .Ignore();
+
+                    #endregion
+                }
+            });
+
+            #region Await completion
+
+            await pumpTask.IgnoreCancellation().ConfigureAwait(false);
+            await Task.WhenAll(runningTasks.Values).IgnoreCancellation().ConfigureAwait(false);
+            tokenSource.Dispose();
+            semaphore.Dispose();
+
+            $"Consumed {numberOfTasks} messages with concurrency {semaphore.CurrentCount} in 5 seconds. Throughput {numberOfTasks / 5} msgs/s"
+                .Output();
+
+            #endregion
+        }
+
+        static Task HandleMessageWithCancellation(CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return Task.Delay(1000, cancellationToken);
+        }
     }
 }
